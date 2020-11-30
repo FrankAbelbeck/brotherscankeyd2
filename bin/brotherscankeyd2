@@ -47,7 +47,7 @@ except ImportError:
 EPOLLRDHUP = 0x2000 # see /usr/include/sys/epoll.h, defined since kernel 2.6.17
 PATH_PID    = "/run/brotherscankeyd2.pid"
 PATH_CONFIG = "/etc/brotherscankeyd2.ini"
-USER_DAEMON = "nobody"
+USER_DAEMON = "lp"
 SYSLOG_IDENT = "brotherscankeyd2"
 
 DEFAULT_FIRST_CYCLE = 3
@@ -799,19 +799,19 @@ Returns:
 # At least one definition assigning a script call expression to a menu item text
 # NOTE: the SANE device identifier 'dev' is automatically inserted  as first
 #       argument into the call
-;PDF ADF        = /usr/bin/bskd2_scan2pdf.sh
-;PDF ADF S1     = /usr/bin/bskd2_scan2pdf.sh odd
-;PDF ADF S2     = /usr/bin/bskd2_scan2pdf.sh even
-;PDF ADF S2 inv = /usr/bin/bskd2_scan2pdf.sh even reversed
+;PDF ADF        = /usr/bin/bskd2_scan2pdf
+;PDF ADF S1     = /usr/bin/bskd2_scan2pdf odd
+;PDF ADF S2     = /usr/bin/bskd2_scan2pdf even
+;PDF ADF S2 inv = /usr/bin/bskd2_scan2pdf even reversed
 
 # menu entry "scan to image" at device MFC-L2720DW
 ;[scan-to-image MFC-L2720DW]
 ;type = image
 ;ip  = 192.168.1.3
 ;dev = brother4:net1;dev0
-;TIFF, 300dpi  = /usr/bin/bskd2_scan2image.sh 300
-;TIFF, 600dpi  = /usr/bin/bskd2_scan2image.sh 600
-;TIFF, 1200dpi = /usr/bin/bskd2_scan2image.sh 1200
+;TIFF, 300dpi  = /usr/bin/bskd2_scan2image 300
+;TIFF, 600dpi  = /usr/bin/bskd2_scan2image 600
+;TIFF, 1200dpi = /usr/bin/bskd2_scan2image 1200
 """.format(
 		FIRSTCYCLE = DEFAULT_FIRST_CYCLE,
 		CYCLE      = DEFAULT_CYCLE,

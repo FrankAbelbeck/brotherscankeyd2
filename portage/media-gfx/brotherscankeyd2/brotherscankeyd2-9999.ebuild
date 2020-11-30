@@ -14,6 +14,8 @@ SLOT="0"
 src_install() {
 	# install program and the init script
 	dobin  ${S}/bin/brotherscankeyd2
+	dobin  ${S}/bin/bskd2_scan2image
+	dobin  ${S}/bin/bskd2_scan2pdf
 	doinitd ${S}/openrc/brotherscankeyd2
 	# extract example configuration file and place it in /etc
 	# set permission so that config is readable by all
