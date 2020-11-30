@@ -121,41 +121,42 @@ Raises:
 		self._devices = {}
 		self._timers = {}
 		self._scanners = {}
+
+		#
+		# daemon section: process general setup, fall back to default values
+		#                 (even if section 'daemon' is not defined)
+		#
+		try:
+			self._tFirstCycle = cfgp.getint("daemon","first cycle",fallback=DEFAULT_FIRST_CYCLE)
+		except ValueError:
+			self._tFirstCycle = DEFAULT_FIRST_CYCLE
+		
+		try:
+			self._tCycle = cfgp.getint("daemon","cycle",fallback=DEFAULT_CYCLE)
+		except ValueError:
+			self._tCycle = DEFAULT_CYCLE
+		
+		try:
+			self._bufferSize = cfgp.getint("daemon","buffer size",fallback=DEFAULT_BUFFER_SIZE)
+		except ValueError:
+			self._bufferSize = DEFAULT_BUFFER_SIZE
+		
+		self._hostDaemon  = cfgp.get("daemon","hostname",fallback=DEFAULT_HOSTNAME)
+		
+		try:
+			self._portDaemon = cfgp.getint("daemon","port",fallback=DEFAULT_PORT)
+		except ValueError:
+			self._portDaemon = DEFAULT_PORT
+		
+		try:
+			self._logLevel = self.LUT_STR2LEVEL[cfgp.get("daemon","log level",fallback=DEFAULT_LOG_LEVEL)]
+			syslog.setlogmask(syslog.LOG_UPTO(self._logLevel))
+		except KeyError:
+			pass
+		
 		for section in cfgp:
 			
-			if section == "daemon":
-				#
-				# daemon section: process general setup
-				#
-				try:
-					self._tFirstCycle = cfgp.getint("daemon","first cycle",fallback=DEFAULT_FIRST_CYCLE)
-				except ValueError:
-					self._tFirstCycle = DEFAULT_FIRST_CYCLE
-				
-				try:
-					self._tCycle = cfgp.getint("daemon","cycle",fallback=DEFAULT_CYCLE)
-				except ValueError:
-					self._tCycle = DEFAULT_CYCLE
-				
-				try:
-					self._bufferSize = cfgp.getint("daemon","buffer size",fallback=DEFAULT_BUFFER_SIZE)
-				except ValueError:
-					self._bufferSize = DEFAULT_BUFFER_SIZE
-				
-				self._hostDaemon  = cfgp.get("daemon","hostname",fallback=DEFAULT_HOSTNAME)
-				
-				try:
-					self._portDaemon = cfgp.getint("daemon","port",fallback=DEFAULT_PORT)
-				except ValueError:
-					self._portDaemon = DEFAULT_PORT
-				
-				try:
-					self._logLevel = self.LUT_STR2LEVEL[cfgp.get("daemon","log level",fallback=DEFAULT_LOG_LEVEL)]
-					syslog.setlogmask(syslog.LOG_UPTO(self._logLevel))
-				except KeyError:
-					pass
-			
-			else:
+			if section != "daemon":
 				#
 				# any other section: menu entry definition
 				#
