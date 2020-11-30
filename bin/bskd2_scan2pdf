@@ -17,6 +17,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>."""
 
+DIR_TARGET="/var/spool/scan"
+
 #
 # usage: scan2pdf.sh devicename [odd|even] [reversed]
 #
@@ -55,6 +57,11 @@ if [ ! -e "/usr/bin/pdftk" ]; then
 	exit 1
 fi
 
+if [ ! -d "$DIR_TARGET" ]; then
+	echo "Could not find spool directory "$DIR_TARGET"!"
+	exit 1
+fi
+
 #
 # security precaution: change into tmp
 #
@@ -69,8 +76,7 @@ else
 	SUFFIX=""
 fi
 
-BASEDIR="/mnt/data/Scan/"
-BASENAME="$BASEDIR$(/bin/date +%Y-%m-%d)_scan"
+BASENAME="$DIR_TARGET$(/bin/date +%Y-%m-%d)_scan"
 FILENAME="$BASENAME$SUFFIX.pdf"
 N=-1
 while [ -e "$FILENAME" ]; do
@@ -96,8 +102,8 @@ if [ -n "$SUFFIX" ]; then
 	# either even or odd set: merge the latest odd/even files into a normal pdf;
 	# if one of these files does not exist, this might be the first half of
 	# duplex scanning, so do nothing.
-	ODDFILE="$(/bin/ls -t1 "$BASEDIR"*-odd.pdf 2>/dev/null | head -1)" # get latest odd file, ignore errors
-	EVENFILE="$(/bin/ls -t1 "$BASEDIR"*-even.pdf 2>/dev/null | head -1)" # get latest even file, ignore errors
+	ODDFILE="$(/bin/ls -t1 "$DIR_TARGET"*-odd.pdf 2>/dev/null | head -1)" # get latest odd file, ignore errors
+	EVENFILE="$(/bin/ls -t1 "$DIR_TARGET"*-even.pdf 2>/dev/null | head -1)" # get latest even file, ignore errors
 	if [ -n "$ODDFILE" -a -n "$EVENFILE" ]; then
 		# odd and even file found
 		# create unique target name

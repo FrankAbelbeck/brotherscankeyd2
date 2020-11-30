@@ -21,7 +21,7 @@ inherit distutils-r1 linux-info git-r3
 
 DESCRIPTION="Python bindings for the Linux eventfd/signalfd/timerfd/inotify syscalls"
 HOMEPAGE="https://www.github.com/abelbeck/linuxfd/ https://pypi.python.org/pypi/linuxfd/"
-EGIT_REPO_URI="git://github.com/FrankAbelbeck/linuxfd.git"
+EGIT_REPO_URI="https://github.com/FrankAbelbeck/linuxfd.git"
 
 LICENSE="LGPL"
 SLOT="0"
