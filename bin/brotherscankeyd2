@@ -1,0 +1,922 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+LICENSE="""brotherscankeyd2: Scan Key Daemon for Brother Inc. Network Scanners
+Copyright (C) 2016-2020 Frank Abelbeck <frank.abelbeck@googlemail.com>
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>."""
+
+import argparse        # ArgumentParser
+import configparser    # ConfigParser, Error
+import errno           # EACCES, EADDRINUSE, EINTR
+import multiprocessing # Process
+import os              # chdir(), devnull, dup2(), environ, fork(), getpid(), 
+                       # getuid(), kill(), remove(), setgid(), setgroups(),
+                       # setsid(), setuid(), umask(), waitpid()
+import os.path         # exists(), isabs(), isfile()
+import platform        # node()
+import pwd             # getpwnam()
+import select          # epoll(), EPOLLIN
+import shlex           # split()
+import signal          # pthread_sigmask(), SIGINT, SIG_SETMASK, SIGTERM
+import socket          # AF_INET, gaierror, SOCK_DGRAM, socket
+import subprocess      # call(), check_output(), STDOUT
+import sys             # exit(), stderr, stdin, stdout
+import syslog          # LOG_ALERT, LOG_CRIT, LOG_DAEMON, LOG_DEBUG, LOG_EMERG,
+                       # LOG_ERR, LOG_INFO, LOG_NOTICE, LOG_UPTO(), LOG_WARNING,
+                       # openlog(), setlogmask(), syslog()
+import time            # sleep()
+
+try:
+	import linuxfd # signalfd, timerfd
+except ImportError:
+	print("Required Python module: linuxfd")
+	sys.exit(1)
+
+
+EPOLLRDHUP = 0x2000 # see /usr/include/sys/epoll.h, defined since kernel 2.6.17
+PATH_PID    = "/run/brotherscankeyd2.pid"
+PATH_CONFIG = "/etc/brotherscankeyd2.ini"
+USER_DAEMON = "nobody"
+SYSLOG_IDENT = "brotherscankeyd2"
+
+DEFAULT_FIRST_CYCLE = 3
+DEFAULT_CYCLE       = 300
+DEFAULT_BUFFER_SIZE = 32767
+DEFAULT_HOSTNAME    = ""
+DEFAULT_PORT        = 54925
+DEFAULT_LOG_LEVEL   = "info"
+
+
+
+class Daemon:
+	"""A class for a Brother Scan Key deamon."""
+	
+	# look-up tables for string to log level conversion
+	LUT_LEVEL2STR = {
+		syslog.LOG_EMERG:   "EMRG",
+		syslog.LOG_ALERT:   "ALRT",
+		syslog.LOG_CRIT:    "CRIT",
+		syslog.LOG_ERR:     "ERR ",
+		syslog.LOG_WARNING: "WARN",
+		syslog.LOG_NOTICE:  "NOTE",
+		syslog.LOG_INFO:    "INFO",
+		syslog.LOG_DEBUG:   "DBUG",
+	}
+	LUT_STR2LEVEL = {
+		"emergency": syslog.LOG_EMERG,
+		"alert": syslog.LOG_ALERT,
+		"critical": syslog.LOG_CRIT,
+		"error": syslog.LOG_ERR,
+		"warning": syslog.LOG_WARNING,
+		"notice": syslog.LOG_NOTICE,
+		"info": syslog.LOG_INFO,
+		"debug": syslog.LOG_DEBUG,
+	}
+	
+	def __init__(self,ident=SYSLOG_IDENT,pathConfig=PATH_CONFIG):
+		"""Constructor: Initialise a daemon instance.
+
+Actions: Opens syslog, sets default log level and stores pathes.
+
+Args:
+   ident: the identity string in log messages.
+   pathConfig: a string, path to the configuration file.
+
+Returns:
+   A Daemon instance.
+"""
+		syslog.openlog(ident=ident,logoption=0,facility=syslog.LOG_DAEMON)
+		self._logLevel = self.LUT_STR2LEVEL[DEFAULT_LOG_LEVEL]
+		syslog.setlogmask(syslog.LOG_UPTO(self._logLevel))
+		self._pathConfig = str(pathConfig)
+		self._config = {}
+		self._devices = {}
+		self._timers = {}
+		self._scanners = {}
+	
+	
+	def parseConfig(self):
+		"""Read and process the configuration file.
+
+Raises:
+   FileExistsError: configuration file does not exist.
+   configparser.Error: parsing the configuration file failed.
+"""
+		if not os.path.exists(self._pathConfig): raise FileExistsError("main configuration file not found")
+		cfgp = configparser.ConfigParser()
+		cfgp.read(self._pathConfig)
+		
+		self._config = {}
+		self._devices = {}
+		self._timers = {}
+		self._scanners = {}
+		for section in cfgp:
+			
+			if section == "daemon":
+				#
+				# daemon section: process general setup
+				#
+				try:
+					self._tFirstCycle = cfgp.getint("daemon","first cycle",fallback=DEFAULT_FIRST_CYCLE)
+				except ValueError:
+					self._tFirstCycle = DEFAULT_FIRST_CYCLE
+				
+				try:
+					self._tCycle = cfgp.getint("daemon","cycle",fallback=DEFAULT_CYCLE)
+				except ValueError:
+					self._tCycle = DEFAULT_CYCLE
+				
+				try:
+					self._bufferSize = cfgp.getint("daemon","buffer size",fallback=DEFAULT_BUFFER_SIZE)
+				except ValueError:
+					self._bufferSize = DEFAULT_BUFFER_SIZE
+				
+				self._hostDaemon  = cfgp.get("daemon","hostname",fallback=DEFAULT_HOSTNAME)
+				
+				try:
+					self._portDaemon = cfgp.getint("daemon","port",fallback=DEFAULT_PORT)
+				except ValueError:
+					self._portDaemon = DEFAULT_PORT
+				
+				try:
+					self._logLevel = self.LUT_STR2LEVEL[cfgp.get("daemon","log level",fallback=DEFAULT_LOG_LEVEL)]
+					syslog.setlogmask(syslog.LOG_UPTO(self._logLevel))
+				except KeyError:
+					pass
+			
+			else:
+				#
+				# any other section: menu entry definition
+				#
+				scripts = {}
+				menuType = None
+				devAddress = None
+				devID = None
+				for key,value in cfgp.items(section):
+					if key == "type":
+						if value in ("file","image","ocr","email"):
+							menuType = value.upper()
+						else:
+							break
+					elif key == "ip":
+						devAddress = value
+					elif key == "dev":
+						devID = value
+					else:
+						pathargs = shlex.split(value)
+						pathargs.insert(1,devID)
+						if not os.path.isabs(pathargs[0]):
+							syslog.syslog(syslog.LOG_WARNING,"Ignoring script '{}' (non-absolute script path)".format(pathargs[0]))
+							continue
+						if not os.path.isfile(pathargs[0]):
+							syslog.syslog(syslog.LOG_WARNING,"Ignoring script '{}' (non-existing script path)".format(pathargs[0]))
+							continue
+						try:
+							# script file exists: record menu text/script
+							# check if entry name can be expressed as octet string
+							# (i.e. can be presented in us-ascii)
+							scripts[key.encode("ascii").decode()] = pathargs
+						except UnicodeError:
+							syslog.syslog(syslog.LOG_WARNING,"Ignoring entry '{}' (not encodable with us-ascii)".format(key))
+				
+				if menuType and devAddress and devID:
+					# required values found: register device, process scripts into daemon's _config structure
+					# set up a new timer and map timer to device IP (timer expires: send new request to scanner IP)
+					try:
+						if self._devices[devAddress] != devID:
+							syslog.syslog(syslog.LOG_WARNING,"Device identifier mismatch for address {} (existing={}, new={})".format(devAddress,devID,self._devices[devAddress]))
+							continue
+					except KeyError:
+						pass
+					try:
+						timer = linuxfd.timerfd(rtc=True,nonBlocking=True)
+					except OSError as e:
+						# OSError: timer creation failed
+						syslog.syslog(syslog.LOG_WARNING,"Device at {} not added due to timer error ({})".format(devAddress,e))
+						continue
+					self._timers[timer.fileno()] = timer
+					self._scanners[timer.fileno()] = devAddress,161
+					self._devices[devAddress] = devID
+					
+					# map scanner's IP address to a device name (used when processing notifications)
+					for key,value in scripts.items():
+						try:
+							self._config[devAddress][menuType][key] = value
+						except KeyError:
+							try:
+								self._config[devAddress][menuType] = { key:value }
+							except KeyError:
+								self._config[devAddress] = { menuType:{ key:value } }
+						syslog.syslog(syslog.LOG_DEBUG,"Added entry {} / {} / {}".format(devAddress,menuType,key))
+		
+		if len(self._devices) == 0:
+			raise configparser.Error("no devices")
+		
+		if len(self._config) == 0:
+			raise configparser.Error("no menu entries")
+	
+	
+	def start(self):
+		"""Start the daemon.
+
+Raises:
+   PermissionError: daemon has to be started as root.
+   FileExistsError: configuration file not found.
+   OSError: socket could not be bound or daemonising failed.
+   configparser.Error: invalid account configuration file."""
+		# parse main configuration file with filter sections
+		try:
+			self.parseConfig()
+		except (configparser.Error,FileExistsError) as e:
+			syslog.syslog(syslog.LOG_ERR,"Parsing configuration file failed ({})".format(e))
+			raise e
+		
+		if os.getuid() != 0:
+			syslog.syslog(syslog.LOG_ERR,"Only root starts the daemon")
+			raise PermissionError
+		
+		if os.path.exists(PATH_PID):
+			syslog.syslog(syslog.LOG_INFO,"PID file found, daemon already started")
+			raise FileExistsError
+		
+		# create non-blocking server socket
+		if not self._hostDaemon:
+			# no hostname argument given: try to obtain it automatically
+			# (read about it on StackOverflow...)
+			s = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+			try:
+				# connect to IANA private network; does not need to exist or be accessible
+				s.connect(("10.0.0.0",1))
+				self._hostDaemon = s.getsockname()[0]
+			except:
+				self._hostDaemon = "127.0.0.1"
+			finally:
+				s.close()
+			syslog.syslog(syslog.LOG_DEBUG,"Automatically determined own IP={}".format(self._hostDaemon))
+			
+		syslog.syslog(syslog.LOG_DEBUG,"Trying to bind UDP port at {}:{}".format(self._hostDaemon,self._portDaemon))
+		
+		try:
+			self._socket_server = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+			self._socket_server.bind(( self._hostDaemon, self._portDaemon ))
+			self._socket_server.setblocking(False)
+			# read back actual hostname/port information
+			self._hostDaemon,self._portDaemon = self._socket_server.getsockname()
+		except OSError as e:
+			syslog.syslog(syslog.LOG_ERR,"Failed to bind UDP address at {}:{}".format(self._hostDaemon,self._portDaemon))
+			raise e
+		
+		syslog.syslog(syslog.LOG_DEBUG,"Opened UDP socket at {}:{}".format(self._hostDaemon,self._portDaemon))
+		
+#		except Exception as e:
+#			syslog.syslog(syslog.LOG_ERR,"Startup error: {}".format(e))
+#			raise e
+#		except OSError as e:
+#			if e.errno == errno.EADDRINUSE: # error: address already in use
+#				# another process is using this address
+#				syslog.syslog(syslog.LOG_ERR,"Address {hostname} already in use!".format(self._hostDaemon))
+#				raise e
+#			elif e.errno == errno.EACCES: # error: permission denied
+#				# most probably a port <1024 should be bound by a non-root process
+#				syslog.syslog(syslog.LOG_ERR,"Permission denied!")
+#				raise e
+#			elif isinstance(e,socket.gaierror):
+#				# unexpected error...
+#				syslog.syslog(syslog.LOG_ERR,"Socket error: {}".format(e))
+#				raise e
+#			else:
+#				syslog.syslog(syslog.LOG_ERR,"OS error: {}".format(e))
+#				raise e
+		
+		# daemonise if necessary
+		self.daemonise()
+		
+		# write PID file
+		try:
+			with open(PATH_PID,"w") as f:
+				f.write(str(os.getpid()))
+		except OSError as e:
+			syslog.syslog(syslog.LOG_ERR,"Writing PID file failed ({})".format(e))
+			raise e
+		
+		# at this point root privileges are not needed anymore
+		try:
+			self.dropPrivileges()
+		except Exception as e:
+			syslog.syslog(syslog.LOG_ERR,"Daemon could not drop privileges ({})".format(e))
+			raise e
+		
+		self.main() # start main loop
+	
+	
+	def stop(self):
+		"""Stop the daemon by sending a SIGTERM signal"""
+		if os.getuid() != 0:
+			syslog.syslog(syslog.LOG_ERR,"Only root stops the daemon")
+			raise PermissionError
+		
+		# Retrieve PID
+		try:
+			with open(PATH_PID,"r") as f:
+				pid = int(f.read())
+		except FileNotFoundError:
+			syslog.syslog(syslog.LOG_INFO,"PID file not found, daemon seems inactive")
+			return
+		except (PermissionError,OSError,TypeError,ValueError):
+			syslog.syslog(syslog.LOG_WARNING,"Could not parse PID file, daemon did not start properly")
+			return
+		
+		# Send SIGTERM to PID
+		try:
+			os.kill(pid,signal.SIGTERM)
+		except ProcessLookupError as e:
+			syslog.syslog(syslog.LOG_WARNING,"Could not find process {}, removing stale PID file".format(pid))
+			os.remove(PATH_PID)
+			return
+		except PermissionError as e:
+			# should not occur, since only root is allowed to handle daemon shutdown
+			syslog.syslog(syslog.LOG_INFO,"You are not allowed to shutdown the daemon")
+			raise e
+		
+		# Wait for termination and remove PID file
+		try:
+			os.waitpid(pid,0)
+		except ChildProcessError:
+			pass # nevermind, PID already has terminated
+		try:
+			os.remove(PATH_PID)
+		except OSError as e:
+			syslog.syslog(syslog.LOG_INFO,"Error during process shutdown")
+			raise e
+	
+	
+	def daemonise(self):
+		"""Daemonise: do a double fork to prevent zombies; second fork prevents child from
+	being session leader and thus prevents it from acquire a (controlling) terminal.
+
+Raises:
+   OSError: Forking failed."""
+		
+		# do first fork, i.e. split a child process and exit if successful
+		# fork() clones the process and lets both processes continue at this
+		# position; the parent process receives the child's PID as result,
+		# while the child receives a 0.
+		# might raise OSError
+		try:
+			pid = os.fork()
+			if pid > 0: # fork returned a PID: this is the parent process, exit!
+				sys.exit(0)
+		except OSError as e:
+			syslog.syslog(syslog.LOG_ERR,"First fork failed ({})".format(e))
+			raise e
+		
+		# now this process continues as the first child
+		# let this first child process become a session leader
+		os.setsid()
+		
+		# do 2nd fork, i.e. split another child process and exit if successful
+		# might raise OSError
+		try:
+			pid = os.fork()
+			if pid > 0:
+				# first child as a session leader should exit, thus leaving
+				# child no. 2 orphaned without ability to open a controlling
+				# terminal and thus preventing zombie processes
+				sys.exit(0)
+		except OSError as e:
+			syslog.syslog(syslog.LOG_ERR,"Second fork failed ({})".format(e))
+			raise e
+		
+		# next step: redirect input/output/error file descriptors
+		# try to redirect them to a logfile (may fail)
+		sys.stdout.flush()
+		sys.stderr.flush()
+		stdin  = open(os.devnull,"r")
+		stdout = open(os.devnull,"a+")
+		stderr = open(os.devnull,"a+")
+		os.dup2(stdin.fileno(),sys.stdin.fileno())
+		os.dup2(stdout.fileno(),sys.stdout.fileno())
+		os.dup2(stderr.fileno(),sys.stderr.fileno())
+		
+		# now this process continues as the second child
+		syslog.syslog(syslog.LOG_INFO,"Daemonised")
+	
+	
+	def dropPrivileges(self):
+		"""Drop privileges to another user.
+
+Raises:
+   OSError: adjusting uid/gid failed."""
+		# obtain USER_DAEMON data
+		p = pwd.getpwnam(USER_DAEMON)
+		# set file permissions mask (ug+rwx,o-rwx)
+		os.umask(0o007)
+		# remove group privileges
+		os.setgroups([])
+		# set user and group ID
+		os.setgid(p.pw_gid)
+		os.setuid(p.pw_uid)
+		# safety catch 
+		if os.getuid() == 0: raise OSError("privileges not dropped")
+		# reset home directory environment variable
+		os.environ['HOME'] = p.pw_dir
+		# switch to the directory root as it's always present
+		os.chdir("/")
+		syslog.syslog(syslog.LOG_INFO,"Privileges dropped")
+	
+	
+	def genAppNum(self,function):
+		"""Generate the internal function number (=APPNUM) for given function.
+
+Args:
+   function: a string; either "IMAGE", "EMAIL", "OCR" or "FILE".
+
+Returns:
+   An integer of set (1,2,3,5).
+
+Raises:
+   ValueError: invalid function string."""
+		if function == "IMAGE":
+			return 1 # as seen in the wireshark dump
+		elif function == "EMAIL":
+			return 2
+		elif function == "OCR":
+			return 3
+		elif function == "FILE":
+			return 5
+		else:
+			raise ValueError
+	
+	
+	def snmpSetRequest(self,fd,function,user):
+		"""Issue an SNMP set request for a Brother variable in order to register with a
+printer's scan key.
+
+According to a wireshark dump, SNMP version 1 is used with community "internal".
+
+Args:
+   fd: an integer; file descriptor of the timer object managing the scanner.
+   function: a string, either "IMAGE", "EMAIL", "OCR" or "FILE".
+   user: a string; the target name shown on the printer's display.
+
+Raises:
+   ValueError: function not in set ("IMAGE","EMAIL","OCR","FILE").
+   OSError: an error occured while calling snmpset."""
+		return subprocess.check_output(["/usr/bin/snmpset",
+			"-c","internal",
+			"-v","1",
+			"udp:{}:{}".format(*self._scanners[fd]),
+			"1.3.6.1.4.1.2435.2.3.9.2.11.1.1.0",
+			"s",
+			"""TYPE=BR;BUTTON=SCAN;USER="{user}";FUNC={function};HOST={hostname}:{port};APPNUM={appnum};DURATION={duration};BRID=;""".format(
+				user     = user,
+				function = function,
+				hostname = self._hostDaemon,
+				port     = self._portDaemon,
+				appnum   = self.genAppNum(function),
+				duration = self._tCycle
+			)
+		],stderr=subprocess.STDOUT)
+	
+	
+	def callScript(self,*args,**kwargs):
+		"""Wrapper function for subprocess.call().
+Adds a two second delay to fix a race condition
+(cf. https://forums.gentoo.org/viewtopic-p-7952026.html).
+
+Args:
+   args: a variable number of arguments passed to call().
+   kwargs: a variable number of key-value argument pairs passed to call().
+
+Returns:
+   An integer; exitcode of the called executable.
+"""
+		time.sleep(2)
+		kwargs["stderr"] = subprocess.STDOUT # redirect stderr to stdout
+		return subprocess.check_output(*args,**kwargs)
+	
+	
+	def main(self):
+		"""Main program loop"""
+		
+		# prepare asynchronous I/O using epoll
+		self._epoll = select.epoll()
+		
+		# prepare process and sequence management
+		processes = dict()
+		seqnum = set()
+		
+		# register and activate all timers
+		for fd,t in self._timers.items():
+			self._epoll.register(fd,select.EPOLLIN)
+			# after self._tFirstCycle seconds the first request is sent
+			# and then every self._tCycle seconds this request is renewed
+			# this daemon is actively scanning devices, because a device might
+			# appear and disappear without notice due to power cycling and might
+			# thus need reinstallation of menu entries
+			t.settime(self._tFirstCycle,self._tCycle)
+		
+		# register with epoll object in level-triggered mode
+		# (EPOLLET = default; neccessary because the socket might hold
+		# more data then a read might fetch...
+		fd_server = self._socket_server.fileno()
+		self._epoll.register(fd_server,select.EPOLLIN)
+		
+		# intercept incoming signals with signalfd and register with epoll
+		self._signalfile = linuxfd.signalfd((signal.SIGTERM,signal.SIGINT),nonBlocking=True)
+		self._epoll.register(self._signalfile.fileno(),select.EPOLLIN)
+		# and now block these signals
+		signal.pthread_sigmask(signal.SIG_SETMASK,{signal.SIGTERM,signal.SIGINT})
+		
+		snmpproc = dict()
+		
+		# enter main loop
+		isRunning = True
+		syslog.syslog(syslog.LOG_DEBUG,"Entering main loop")
+		while isRunning:
+			#
+			# event-driven loop:
+			#  - epoll is monitoring socket, processes, signals and timers
+			#  - loop only does something when...
+			#     * self._socket_server: socket is readable (=new datagram available)
+			#     * processes: background process needs attention (=terminated or has new output)
+			#     * snmpproc: snmp request process need attention (=terminated or has new output)
+			#     * self._signalfile: signal received (most likely SIGTERM or SIGINT)
+			#     * self._scanners: timer expired (issue new SNMP request; active device tracking)
+			#
+			# epoll.poll() has to be enclosed in try..except because
+			# signals might interrupt it -- this case is intercepted and handled
+			# by catching EINTR errors
+			try:
+				fdevents = self._epoll.poll(-1)
+			except OSError as e:
+				if e.errno == errno.EINTR:
+					continue # system call was interrupted: enter next loop iteration
+				raise # re-raise uncaught OSError
+			
+			for fd,fdevent in fdevents:
+				
+				if fd == fd_server:
+					syslog.syslog(syslog.LOG_DEBUG,"Server socket has new data")
+					#
+					# server socket became readable: new input
+					#
+					# sample input:
+					#  data    = b'\x02\x00z0TYPE=BR;BUTTON=SCAN;USER="pdf adf";FUNC=FILE;HOST=192.168.1.169:54925;APPNUM=5;P1=0;P2=0;P3=0;P4=0;REGID=13078;SEQ=3;'
+					#  address = ('192.168.1.3', 42420)
+					#
+					data,address = self._socket_server.recvfrom(self._bufferSize)
+					syslog.syslog(syslog.LOG_DEBUG,"Incoming UDP packet: data={}, address={}".format(data,address))
+					datastr = data.decode(errors="ignore")
+					try:
+						datadict = dict([i.split("=",1) for i in datastr[datastr.index("TYPE=BR;"):].split(";") if "=" in i])
+					except ValueError:
+						# index() failed --> no TYPE=BR field --> invalid packet
+						continue
+					# sanity check:
+					#  - scan button?
+					#  - appnum corresponds to function?
+					#  - correct hostname:port?
+					#  - sequence number not yet seen?
+					# (at least my scanner sends two identical packets)
+					try:
+						hostname,port = datadict["HOST"].rsplit(":",1)
+						port = int(port)
+						user = datadict["USER"].strip('"')
+						function = datadict["FUNC"]
+						button = datadict["BUTTON"]
+						appnum = int(datadict["APPNUM"])
+						seq = datadict["SEQ"]
+					except (ValueError,KeyError):
+						# erroneous message/invalid port: ignore
+						continue
+					if button != "SCAN" or appnum != self.genAppNum(function) or \
+						hostname != self._hostDaemon or port != self._portDaemon or \
+						seq in seqnum:
+						continue
+					
+					# scan button message; appnum equivalent to function name
+					# correct hostname/port and sequence number not seen yet
+					# -> call a script associated with given function/user name
+					syslog.syslog(syslog.LOG_INFO,'Scan button event "{}"/"{}" received from {}'.format(function,user,address[0]))
+					
+					if address[0] not in self._devices:
+						# a deviced called in that is not registered? nevermind
+						continue
+					
+					try:
+						# call script as background process and register its
+						# sentinel with epoll (event-driven process management)
+						seqnum.add(seq)
+						process = multiprocessing.Process(
+							target=self.callScript,
+							kwargs={
+								"args":self._config[address[0]][function][user]
+							}
+						)
+						process.start()
+						processes[process.sentinel] = process,seq
+						self._epoll.register(process.sentinel,select.EPOLLIN | EPOLLRDHUP)
+						syslog.syslog(syslog.LOG_DEBUG,"Script call: {} (process {})".format(self._config[address[0]][function][user],process.pid))
+					except:
+						# either call() failed or no script is connected to said device/function/user:
+						# need to think of a way to send an error message to the scanner?
+						syslog.syslog(syslog.LOG_EMERG,"Problem calling script {}".format(self._config[address[0]][function][user]))
+				
+				elif fd in self._scanners:
+					syslog.syslog(syslog.LOG_DEBUG,"Timer expired")
+					#
+					# a timer expired: repeat SNMP SET requests
+					#
+					self._timers[fd].read() # read timer to disarm epoll on this fd
+					hostname,port = self._scanners[fd]
+					for function in self._config[hostname].keys():
+						for user in self._config[hostname][function].keys():
+							procname="{0}:{1}/{2}/{3}".format(hostname,port,function,user)
+							try:
+								syslog.syslog(syslog.LOG_DEBUG,"SNMP SET request sent (process {})".format(procname))
+								# create subprocess, register with epoll/snmpproc and start it
+								proc = multiprocessing.Process(
+									name=procname,
+									target=self.snmpSetRequest,
+									args=(fd,function,user)
+								)
+								proc.start()
+								self._epoll.register(proc.sentinel,select.EPOLLIN | EPOLLRDHUP)
+								snmpproc[proc.sentinel] = proc
+							except:
+								pass
+				
+				elif fd in processes:
+					syslog.syslog(syslog.LOG_DEBUG,"Process needs attention")
+					#
+					# process management: process terminated (sentinel became readable)
+					# remove process+seq from list, unregister sentinel
+					#
+					proc,seq= processes[fd]
+					if proc.exitcode == None:
+						# returncode None: process has not yet terminated,
+						# but stdout hung up; zombie? kill it!
+						try:
+							proc.terminate()
+						except ProcessLookupError:
+							pass # process has terminated, ignore
+						except:
+							# uh-oh, root should look into this PID
+							syslog.syslog(syslog.LOG_EMERG,"Potential problem with script PID={0}".format(proc.pid))
+					else:
+						syslog.syslog(syslog.LOG_DEBUG,"Script terminated with code {}".format(proc.exitcode))
+					self._epoll.unregister(fd)
+					del processes[fd]
+					seqnum.remove(seq)
+				
+				elif fd in snmpproc:
+					syslog.syslog(syslog.LOG_DEBUG,"SNMP process needs attention")
+					#
+					# SNMP process management: process terminated (sentinel became readable)
+					# remove process from list, unregister sentinel
+					#
+					proc = snmpproc[fd]
+					if proc.exitcode == None:
+						# returncode None: process has not yet terminated,
+						# but stdout hung up; zombie? kill it!
+						try:
+							proc.terminate()
+						except ProcessLookupError:
+							# process has terminated, ignore
+							pass
+						except:
+							syslog.syslog(syslog.LOG_EMERG,"Potential problem with SNMP request (PID={0})".format(proc.pid))
+					elif proc.exitcode == 0:
+						syslog.syslog(syslog.LOG_DEBUG,"SNMP request ({}) completed".format(proc.name))
+					else:
+						syslog.syslog(syslog.LOG_DEBUG,"SNMP request ({}) terminated with code {}".format(proc.name,proc.exitcode))
+					self._epoll.unregister(fd)
+					del snmpproc[fd]
+				
+				elif fd == self._signalfile.fileno():
+					syslog.syslog(syslog.LOG_DEBUG,"Signal received")
+					#
+					# pending signal
+					#
+					try:
+						siginfo = self._signalfile.read()
+						if siginfo["signo"] == signal.SIGTERM:
+							# should terminate: end loop
+							syslog.syslog(syslog.LOG_INFO,"Received SIGTERM: terminating...")
+							isRunning = False
+						# SIGINT is silently ignored
+					except:
+						pass
+		
+		syslog.syslog(syslog.LOG_DEBUG,"Left main loop")
+		
+		# loop ended: terminate background processes and remove PID file
+		for fd,proc in snmpproc.items():
+			syslog.syslog(syslog.LOG_DEBUG,"terminating SNMP SET process {}".format(proc.name))
+			proc.terminate()
+			proc.join()
+			syslog.syslog(syslog.LOG_DEBUG,"SNMP SET process {} terminated".format(proc.name))
+		for fd,proc in processes.items():
+			syslog.syslog(syslog.LOG_DEBUG,"terminating background process {}".format(proc.name))
+			proc.terminate()
+			proc.join()
+			syslog.syslog(syslog.LOG_DEBUG,"Background process {} terminated".format(proc.name))
+		
+		os.remove(PATH_PID)
+		
+		syslog.syslog(syslog.LOG_INFO,"Bye")
+	
+	
+	def printConfigMain(self):
+		"""Print example configuration file to stdout."""
+		print("""# Brother Scan Key daemon
+# Main configuration file
+# INI file syntax; comments begin either with a # or a ;
+# Explanations are commented out with #
+# Example values are commented out with ;
+
+# Daemon Parameters
+# (optional, program falls back to defaults if missing or incomplete)
+;[daemon]
+
+# Option: delay in seconds until first SNMP request is sent
+# Default: {FIRSTCYCLE}
+;first cycle = {FIRSTCYCLE}
+
+# Option: delay in seconds between consecutive SNMP requests
+# Default: {CYCLE}
+;cycle = {CYCLE}
+
+# Option: number of bytes to read when new UDP packets arrive
+# Default: {BUFFER}
+;buffer size = {BUFFER}
+
+# Option: hostname to listen on; if unset or empty, the platform's hostname
+#         will be used
+# Default: {HOSTNAME}
+;hostname = {HOSTNAME}
+
+# Option: UDP port to listen on
+# Default: {PORT}
+;port = {PORT}
+
+# Option: minimal log level; all program messages with the same or higher
+#         log priority level are logged, program messages with lower log level
+#         will be discarded
+# Values in ascending priority order:
+#    debug info notice warning error critical alert emergency
+# Default: {LOGLEVEL}
+;log level = {LOGLEVEL}
+
+# Scanner Menu Entries: all sections with names other than 'daemon'
+#
+# menu entry "scan to file" at device MFC-L2720DW
+;[scan-to-file MFC-L2720DW]
+
+# Required: type of the menu for which to define entries; accepts values
+#           'file' (menu "Scan to file"), 'image' (menu "Scan to image"),
+#           'ocr' (menu "Scan to OCR"), and 'email' (menu "Scan to E-Mail")
+;type = file
+
+# Required: IP address of the scanner
+;ip  = 192.168.1.3
+
+# Required: SANE device identifier
+;dev = brother4:net1;dev0
+
+# At least one definition assigning a script call expression to a menu item text
+# NOTE: the SANE device identifier 'dev' is automatically inserted  as first
+#       argument into the call
+;PDF ADF        = /usr/bin/scan2pdf.sh
+;PDF ADF S1     = /usr/bin/scan2pdf.sh odd
+;PDF ADF S2     = /usr/bin/scan2pdf.sh even
+;PDF ADF S2 inv = /usr/bin/scan2pdf.sh even reversed
+
+# menu entry "scan to image" at device MFC-L2720DW
+;[scan-to-image MFC-L2720DW]
+;type = image
+;ip  = 192.168.1.3
+;dev = brother4:net1;dev0
+;TIFF, 300dpi  = /usr/bin/scan2image.sh 300
+;TIFF, 600dpi  = /usr/bin/scan2image.sh 600
+;TIFF, 1200dpi = /usr/bin/scan2image.sh 1200
+""".format(
+		FIRSTCYCLE = DEFAULT_FIRST_CYCLE,
+		CYCLE      = DEFAULT_CYCLE,
+		BUFFER     = DEFAULT_BUFFER_SIZE,
+		HOSTNAME   = DEFAULT_HOSTNAME,
+		PORT       = DEFAULT_PORT,
+		LOGLEVEL   = DEFAULT_LOG_LEVEL)
+	)
+	
+	
+	def dropPrivileges(self):
+		"""Drop privileges to another user.
+
+Raises:
+   OSError: adjusting uid/gid failed."""
+		# obtain USER_DAEMON data
+		p = pwd.getpwnam(USER_DAEMON)
+		# set file permissions mask (ug+rwx,o-rwx)
+		os.umask(0o007)
+		# remove group privileges
+		os.setgroups([])
+		# set user and group ID
+		os.setgid(p.pw_gid)
+		os.setuid(p.pw_uid)
+		# safety catch 
+		if os.getuid() == 0: raise OSError("privileges not dropped")
+		# reset home directory environment variable
+		os.environ['HOME'] = p.pw_dir
+		# switch to the directory root as it's always present
+		os.chdir("/")
+		syslog.syslog(syslog.LOG_INFO,"Privileges dropped")
+	
+	
+	def daemonise(self):
+		"""Put program into background.
+		
+Do a double fork to prevent zombies. Second fork prevents child from being
+session leader and thus prevents it from acquiring a (controlling) terminal.
+
+Changes user ID to the owner of this program file.
+
+Raises:
+   OSError: double fork failed.
+"""
+		
+		# do first fork, i.e. split a child process and exit if successful
+		# fork() clones the process and lets both processes continue at this
+		# position; the parent process receives the child's PID as result,
+		# while the child receives a 0.
+		try:
+			pid = os.fork()
+			if pid > 0: # fork returned a PID: this is the parent process, exit!
+				sys.exit(0)
+		except OSError as e:
+			syslog.syslog(syslog.LOG_ERR,"First fork failed: {}".format(e))
+			raise e
+		
+		# now this process continues as the first child
+		# let this first child process become a session leader
+		os.setsid()
+		
+		# do 2nd fork, i.e. split another child process and exit if successful
+		try:
+			pid = os.fork()
+			if pid > 0:
+				# first child as a session leader should exit, thus leaving
+				# child no. 2 orphaned without ability to open a controlling
+				# terminal and thus preventing zombie processes
+				sys.exit(0)
+		except OSError as e:
+			syslog.syslog(syslog.LOG_ERR,"Second fork failed: {}".format(e))
+			raise e
+		
+		# next step: redirect input/output/error file descriptors
+		sys.stdout.flush()
+		sys.stderr.flush()
+		stdin  = open(os.devnull,"r")
+		stdout = open(os.devnull,"a+")
+		stderr = open(os.devnull,"a+")
+		os.dup2(stdin.fileno(),sys.stdin.fileno())
+		os.dup2(stdout.fileno(),sys.stdout.fileno())
+		os.dup2(stderr.fileno(),sys.stderr.fileno())
+	
+		# now this process continues as the second child
+		syslog.syslog(syslog.LOG_INFO,"Daemonised")
+
+
+
+if __name__ == '__main__':
+	# setup argument parser and parse commandline arguments
+	daemon = Daemon()
+	parser = argparse.ArgumentParser(description='Brother Scan Key Daemon: manage menu actions on Brother scanners.')
+	subparsers = parser.add_subparsers()
+	subparser_start = subparsers.add_parser("start",help="Start the daemon")
+	subparser_start.set_defaults(f=daemon.start)
+	subparser_stop = subparsers.add_parser("stop",help="Stop the daemon")
+	subparser_stop.set_defaults(f=daemon.stop)
+	subparser_info = subparsers.add_parser("cfgMain",help="Print basic main configuration file")
+	subparser_info.set_defaults(f=daemon.printConfigMain)
+	args = parser.parse_args()
+	try:
+		args.f()
+	except AttributeError as e:
+		print(e)
+		parser.print_help()
+	except Exception as e:
+		print("daemon failed: {}".format(e))
+		sys.exit(4)
