@@ -98,7 +98,7 @@ Returns:
 		self._tFirstCycle = DEFAULT_FIRST_CYCLE
 		self._tCycle = DEFAULT_CYCLE
 		self._bufferSize = DEFAULT_BUFFER_SIZE
-		self._hostDaemon  = cfgp.get("daemon","hostname",fallback=DEFAULT_HOSTNAME)
+		self._hostDaemon  = DEFAULT_HOSTNAME
 		self._portDaemon = DEFAULT_PORT
 		self._userDaemon = DEFAULT_USER_DAEMON
 		self._logLevel = self.LUT_STR2LEVEL[DEFAULT_LOG_LEVEL]
