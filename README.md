@@ -1,8 +1,8 @@
-# brotherscankeyd2: Scan Key Daemon for Brother Inc. Network Scanners, verison 2
+# brotherscankeyd2: Scan Key Daemon for Brother Inc. Network Scanners, version 2
 
 Copyright (C) 2016-2020 Frank Abelbeck <frank.abelbeck@googlemail.com>
 
-License: GLP 3
+License: GPL 3
 
 ## Overview
 
