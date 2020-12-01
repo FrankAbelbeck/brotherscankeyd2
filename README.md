@@ -106,6 +106,8 @@ configuration and scripting.
 
 ## Changelog Version 2
 
+ * **2020-12-01:** user setting now tweakable via configuration file
+ 
  * **2020-11-30:** initial commit, adapted to current Abelbeck coding standard
 
 ## Changelog Version 1
@@ -130,6 +132,3 @@ configuration and scripting.
  
  * **2016-07-05:** initial release as "works for me" version (except for the scan
    scripts scan2image.sh and scan2pdf.sh; they are still untested)
-
-
- 

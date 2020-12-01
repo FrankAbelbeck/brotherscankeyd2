@@ -27,4 +27,6 @@ src_install() {
 pkg_postinst() {
 	elog "Please edit /etc/brotherscankeyd2.ini."
 	elog "You need to define some menu entries, otherwise this daemon does nothing."
+	elog "And please check if the default daemon user exists on your system."
+	elog "If not either create it or change it to an existing suitable user."
 }

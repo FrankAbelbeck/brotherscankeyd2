@@ -47,7 +47,6 @@ except ImportError:
 EPOLLRDHUP = 0x2000 # see /usr/include/sys/epoll.h, defined since kernel 2.6.17
 PATH_PID    = "/run/brotherscankeyd2.pid"
 PATH_CONFIG = "/etc/brotherscankeyd2.ini"
-USER_DAEMON = "lp"
 SYSLOG_IDENT = "brotherscankeyd2"
 
 DEFAULT_FIRST_CYCLE = 3
@@ -56,7 +55,7 @@ DEFAULT_BUFFER_SIZE = 32767
 DEFAULT_HOSTNAME    = ""
 DEFAULT_PORT        = 54925
 DEFAULT_LOG_LEVEL   = "info"
-
+DEFAULT_USER_DAEMON = "lp"
 
 
 class Daemon:
@@ -96,9 +95,16 @@ Args:
 Returns:
    A Daemon instance.
 """
-		syslog.openlog(ident=ident,logoption=0,facility=syslog.LOG_DAEMON)
+		self._tFirstCycle = DEFAULT_FIRST_CYCLE
+		self._tCycle = DEFAULT_CYCLE
+		self._bufferSize = DEFAULT_BUFFER_SIZE
+		self._hostDaemon  = cfgp.get("daemon","hostname",fallback=DEFAULT_HOSTNAME)
+		self._portDaemon = DEFAULT_PORT
+		self._userDaemon = DEFAULT_USER_DAEMON
 		self._logLevel = self.LUT_STR2LEVEL[DEFAULT_LOG_LEVEL]
+		syslog.openlog(ident=ident,logoption=0,facility=syslog.LOG_DAEMON)
 		syslog.setlogmask(syslog.LOG_UPTO(self._logLevel))
+		
 		self._pathConfig = str(pathConfig)
 		self._config = {}
 		self._devices = {}
@@ -147,6 +153,11 @@ Raises:
 			self._portDaemon = cfgp.getint("daemon","port",fallback=DEFAULT_PORT)
 		except ValueError:
 			self._portDaemon = DEFAULT_PORT
+		
+		try:
+			self._userDaemon = cfgp.getint("daemon","user",fallback=DEFAULT_USER_DAEMON)
+		except ValueError:
+			self._userDaemon = DEFAULT_USER_DAEMON
 		
 		try:
 			self._logLevel = self.LUT_STR2LEVEL[cfgp.get("daemon","log level",fallback=DEFAULT_LOG_LEVEL)]
@@ -419,8 +430,8 @@ Raises:
 
 Raises:
    OSError: adjusting uid/gid failed."""
-		# obtain USER_DAEMON data
-		p = pwd.getpwnam(USER_DAEMON)
+		# obtain self._userDaemon data
+		p = pwd.getpwnam(self._userDaemon)
 		# set file permissions mask (ug+rwx,o-rwx)
 		os.umask(0o007)
 		# remove group privileges
@@ -773,6 +784,10 @@ Returns:
 # Default: {PORT}
 ;port = {PORT}
 
+# Option: which user should run the daemon after having dropped privileges?
+# Default: {USER}
+; user = {USER}
+
 # Option: minimal log level; all program messages with the same or higher
 #         log priority level are logged, program messages with lower log level
 #         will be discarded
@@ -819,6 +834,7 @@ Returns:
 		BUFFER     = DEFAULT_BUFFER_SIZE,
 		HOSTNAME   = DEFAULT_HOSTNAME,
 		PORT       = DEFAULT_PORT,
+		USER       = DEFAULT_USER_DAEMON,
 		LOGLEVEL   = DEFAULT_LOG_LEVEL)
 	)
 	
@@ -828,8 +844,8 @@ Returns:
 
 Raises:
    OSError: adjusting uid/gid failed."""
-		# obtain USER_DAEMON data
-		p = pwd.getpwnam(USER_DAEMON)
+		# obtain self._userDaemon data
+		p = pwd.getpwnam(self._userDaemon)
 		# set file permissions mask (ug+rwx,o-rwx)
 		os.umask(0o007)
 		# remove group privileges
