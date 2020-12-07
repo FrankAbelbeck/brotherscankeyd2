@@ -62,6 +62,17 @@ Obviously, you'll need SANE to be able to scan anything, or more precisely,
 Image processing and pdf handling is done using `/usr/bin/convert` (imagemagick)
 and `/usr/bin/pdftk` (pdftk).
 
+In addition you need to check if `convert` is allowed to read/write pdf files.
+Open `/etc/ImageMagick-7/policy.xml` and make sure that the following line is
+defined. 
+
+```
+<policy domain="coder" rights="read|write" pattern="PDF" />
+```
+
+Per default this is disabled (`rights="none"`) in order to mitigate
+ghostscript vulnerabilities (https://bugs.gentoo.org/664236).
+
 ## Installation: From Source
 
 The following steps assume being run on a standard Linux system with OpenRC as user root.
