@@ -53,12 +53,14 @@ and eventfd system calls.
 In order to execute the provided sample scripts you need the following programs:
 
  * sane-backends (1.0.30-r2, http://www.sane-project.org/)
+ * sane-frontends (1.0.14-r5, http://www.sane-project.org/)
  * imagemagick (7.0.10.35, https://www.imagemagick.org/)
  * pdftk (3.0.0, https://gitlab.com/pdftk-java/pdftk)
 
-Obviously, for scanning something you'll need SANE, or more precisely,
-`/usr/bin/scanimage` and `/usr/bin/scanadf`. Image processing and pdf handling
-is done using `/usr/bin/convert` (imagemagick) and `/usr/bin/pdftk` (pdftk).
+Obviously, you'll need SANE to be able to scan anything, or more precisely,
+`/usr/bin/scanimage` (backend) and `/usr/bin/scanadf` (frontend).
+Image processing and pdf handling is done using `/usr/bin/convert` (imagemagick)
+and `/usr/bin/pdftk` (pdftk).
 
 ## Installation: From Source
 
